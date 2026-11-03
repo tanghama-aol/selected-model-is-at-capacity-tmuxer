@@ -115,6 +115,13 @@ class Tmux:
         time.sleep(0.4)  # 让输入框稳定后再回车
         return self._run("send-keys", "-t", target, "Enter") is not None
 
+    def send_key(self, target, key):
+        """发送一个按键名（如 Escape、C-c）。"""
+        return self._run("send-keys", "-t", target, key) is not None
+
+    def kill_session(self, name):
+        return self._run("kill-session", "-t", f"={name}") is not None
+
     def composer_is_empty(self, target):
         """输入框是否为空白占位符（纯 Python 判断，失败即视为非空）。"""
         frame = self.capture(target, ansi=True)

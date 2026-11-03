@@ -21,9 +21,9 @@
 body { margin: 0; background: var(--bg); color: var(--text);
   font: 14px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; }
 header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px;
-  padding: 14px 16px; border-bottom: 1px solid var(--line); background: var(--card); }
+  padding: 14px 10px; border-bottom: 1px solid var(--line); background: var(--card); }
 header h1 { font-size: 18px; margin: 0; flex: 1; }
-main { max-width: 1200px; margin: 0 auto; padding: 16px; display: grid; gap: 16px; }
+main { margin: 0; padding: 10px; display: grid; gap: 10px; justify-items: stretch; }
 section { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
 section h2 { margin: 0 0 10px; font-size: 15px; display: flex; align-items: center; gap: 8px; }
 button { font: inherit; padding: 5px 12px; border-radius: 6px; border: 1px solid var(--line);
@@ -38,7 +38,10 @@ button.small { padding: 2px 8px; font-size: 12px; }
 .STOPPED { color: var(--warn); } .GONE { color: var(--idle); }
 .sessions { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; }
 .session { display: flex; align-items: center; gap: 8px; padding: 8px 10px;
-  border: 1px solid var(--line); border-radius: 6px; cursor: pointer; }
+  border: 1px solid var(--line); border-radius: 6px; }
+.session label { display: flex; align-items: center; gap: 8px; flex: 1; cursor: pointer; min-width: 0; }
+button.danger { color: var(--bad); }
+.PAUSED { color: var(--warn); }
 .session.on { border-color: var(--accent); }
 .session .name { font-weight: 600; word-break: break-all; }
 .tag { font-size: 11px; padding: 0 6px; border-radius: 4px; background: var(--accent); color: #fff; }
@@ -148,12 +151,16 @@ function renderSessions(s) {
   const box = document.getElementById("sessions");
   if (!s.sessions.length) { box.innerHTML = '<div class="empty">没有发现 tmux 会话。请先在 tmux 中启动 Codex。</div>'; return; }
   box.innerHTML = s.sessions.map(x => `
-    <label class="session ${x.selected ? "on" : ""}">
-      <input type="checkbox" data-session="${esc(x.name)}" ${x.selected ? "checked" : ""}>
-      <span class="name">${esc(x.name)}</span>
-      ${x.is_codex ? '<span class="tag">Codex</span>' : ""}
-      <span class="muted">${x.windows} 窗口${x.attached ? " · 已连接" : ""}</span>
-    </label>`).join("");
+    <div class="session ${x.selected ? "on" : ""}">
+      <label>
+        <input type="checkbox" data-session="${esc(x.name)}" ${x.selected ? "checked" : ""}>
+        <span class="name">${esc(x.name)}</span>
+        ${x.is_codex ? '<span class="tag">Codex</span>' : ""}
+        <span class="muted">${x.windows} 窗口${x.attached ? " · 已连接" : ""}</span>
+      </label>
+      <button class="small" data-stop-session="${esc(x.name)}" title="中断该会话中的任务并暂停自动发送">停止</button>
+      <button class="small danger" data-delete-session="${esc(x.name)}" title="删除（kill）该 tmux 会话">删除</button>
+    </div>`).join("");
 }
 
 function renderPanes(s) {
@@ -162,7 +169,7 @@ function renderPanes(s) {
   box.innerHTML = s.panes.map(p => {
     let plan = "—";
     if (p.state === "WORKING") plan = "无需操作";
-    else if (!p.enabled) plan = "已禁用自动发送";
+    else if (p.paused) plan = "任务已暂停" + (p.pause_reason ? `（${p.pause_reason}）` : "");
     else if (!s.running) plan = "全局已暂停";
     else if (p.send_in != null) plan = `${dur(p.send_in)} 后发送（本次随机等待 ${dur(p.wait_seconds)}）`;
     else if (p.stopped_for != null) {
@@ -176,7 +183,10 @@ function renderPanes(s) {
         <span class="pill ${p.state}">${STATE_NAMES[p.state] || p.state}</span>
         ${p.is_codex ? "" : '<span class="muted">（未识别为 Codex）</span>'}
         <span class="grow"></span>
-        <label class="muted"><input type="checkbox" data-enable="${esc(p.target)}" ${p.enabled ? "checked" : ""}> 自动发送</label>
+        ${p.paused ? '<span class="pill PAUSED">已暂停</span>' : ""}
+        ${p.paused
+          ? `<button class="small primary" data-resume="${esc(p.target)}">继续</button>`
+          : `<button class="small" data-pause="${esc(p.target)}">暂停</button>`}
         <button class="small" data-send="${esc(p.target)}">立即发送</button>
       </div>
       <div class="kv">
@@ -225,16 +235,21 @@ document.getElementById("sessions").onchange = e => {
   act("/api/select", { sessions: names });
 };
 document.getElementById("send-all").onclick = () => {
-  const n = snap ? snap.panes.filter(p => p.state === "STOPPED" || p.state === "CAPACITY").length : 0;
+  const n = snap ? snap.panes.filter(p => !p.paused && (p.state === "STOPPED" || p.state === "CAPACITY")).length : 0;
   if (n && confirm(`立即向 ${n} 个未在工作的任务发送 “${snap.config.send_text}”？`)) act("/api/send-all", {});
 };
 document.getElementById("panes").addEventListener("click", e => {
-  const t = e.target.dataset.send;
-  if (t && confirm(`立即向 ${t} 发送 “${snap.config.send_text}”？`)) act("/api/pane/send", { target: t });
+  const d = e.target.dataset;
+  if (d.send && confirm(`立即向 ${d.send} 发送 “${snap.config.send_text}”？`)) act("/api/pane/send", { target: d.send });
+  if (d.pause) act("/api/pane/paused", { target: d.pause, paused: true });
+  if (d.resume) act("/api/pane/paused", { target: d.resume, paused: false });
 });
-document.getElementById("panes").addEventListener("change", e => {
-  const t = e.target.dataset.enable;
-  if (t) act("/api/pane/enabled", { target: t, enabled: e.target.checked });
+document.getElementById("sessions").addEventListener("click", e => {
+  const d = e.target.dataset;
+  if (d.stopSession && confirm(`停止会话 ${d.stopSession}？\n将向其中的 Codex 发送 Esc 中断当前任务，并暂停自动发送。`))
+    act("/api/session/stop", { name: d.stopSession });
+  if (d.deleteSession && confirm(`确定删除 tmux 会话 ${d.deleteSession}？\n会话及其中运行的所有程序都会被终止，且无法恢复。`))
+    act("/api/session/delete", { name: d.deleteSession });
 });
 document.getElementById("panes").addEventListener("toggle", e => {
   const t = e.target.dataset && e.target.dataset.target;
