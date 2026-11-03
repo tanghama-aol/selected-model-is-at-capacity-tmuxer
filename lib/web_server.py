@@ -77,6 +77,13 @@ def make_handler(monitor):
                     monitor.update_config(data)
                 elif self.path == "/api/pane/enabled":
                     monitor.set_pane_enabled(data["target"], data.get("enabled", True))
+                elif self.path == "/api/pane/paused":
+                    monitor.set_pane_paused(data["target"], data.get("paused", True))
+                elif self.path == "/api/session/stop":
+                    monitor.stop_session(data["name"])
+                    monitor.refresh()
+                elif self.path == "/api/session/delete":
+                    monitor.delete_session(data["name"])
                 elif self.path == "/api/pane/send":
                     monitor.send_now(data["target"])
                     monitor.refresh()
@@ -86,7 +93,7 @@ def make_handler(monitor):
                 else:
                     return self._json({"error": "未找到"}, 404)
             except KeyError as exc:
-                return self._json({"error": f"找不到 pane: {exc}"}, 404)
+                return self._json({"error": f"找不到 pane/会话: {exc}"}, 404)
             except (ValueError, TypeError) as exc:
                 return self._json({"error": str(exc)}, 400)
             self._json(monitor.snapshot())

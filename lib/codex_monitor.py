@@ -29,7 +29,8 @@ DEFAULT_CONFIG = {
     "composer_quiet": 20,         # 输入框内容在最近多少秒内有变化则跳过发送（0 = 不检查）
     "window": 20,                 # 底部多少行算"当前"
     "busy_re": r"esc to interrupt",
-    "cap_re": r"Selected model is at capacity",
+    "cap_re": r"rate limit exceeded",
+    "goal_re": r"Goal achieved",  # 最后两行出现该标识 → 暂停该任务，不再发送
     "codex_re": r"OpenAI Codex|esc to interrupt|context left|"
                 r"Selected model is at capacity|^\s*[›»] ",
 }
@@ -54,6 +55,13 @@ def looks_like_codex(command, text, cfg):
     if "codex" in (command or "").lower():
         return True
     return bool(text and re.search(cfg["codex_re"], text, re.I | re.M))
+
+
+def goal_achieved(text, cfg):
+    """画面最后两行（忽略空行）是否出现"目标已完成"标识。"""
+    lines = [l for l in text.rstrip("\n").split("\n") if l.strip()]
+    goal = re.compile(cfg["goal_re"], re.I)
+    return any(goal.search(line) for line in lines[-2:])
 
 
 COMPOSER_ROW_RE = re.compile(r"^\s*[›»]")
@@ -88,7 +96,10 @@ class PaneState:
         self.is_codex = False
         self.state = STOPPED
         self.detail = ""
-        self.enabled = True          # 是否对该 pane 自动发送
+        self.enabled = True          # 是否对该 pane 自动发送（False = 已暂停）
+        self.pause_reason = ""       # 暂停原因
+        self.goal_visible = False    # 最后两行当前是否有 Goal achieved
+        self.goal_ack = False        # 用户已"继续"：该标识消失前不再自动暂停
         self.last_hash = None
         self.composer_text = None    # 最近一次观察到的输入框内容
         self.composer_seen = False   # 是否已观察过输入框（首次观察不算"变化"）
@@ -110,6 +121,8 @@ class PaneState:
             "state": self.state,
             "detail": self.detail,
             "enabled": self.enabled,
+            "paused": not self.enabled,
+            "pause_reason": self.pause_reason,
             "stopped_for": None if self.stopped_since is None
             else int(now - self.stopped_since),
             "send_in": None if self.next_send_at is None
@@ -205,12 +218,51 @@ class Monitor:
         self._wake.set()
 
     def set_pane_enabled(self, target, enabled):
+        self.set_pane_paused(target, not enabled)
+
+    def set_pane_paused(self, target, paused, reason="手动暂停"):
+        """暂停/继续单个任务的自动发送。"""
         with self.lock:
             pane = self.panes.get(target)
             if pane is None:
                 raise KeyError(target)
-            pane.enabled = bool(enabled)
-            self.log(f"{target} 自动发送已{'启用' if enabled else '禁用'}")
+            pane.enabled = not paused
+            if paused:
+                pane.pause_reason = reason
+                pane.next_send_at = pane.wait_seconds = None
+                pane.note = f"任务已暂停（{reason}）"
+            else:
+                pane.pause_reason = ""
+                # 继续后，在 Goal achieved 消失前不再因它自动暂停
+                pane.goal_ack = pane.goal_visible
+                pane.stopped_since = self.clock()
+                pane.note = "任务已继续"
+            self.log(f"{target} {pane.note}")
+        self._wake.set()
+
+    def stop_session(self, name):
+        """停止会话中的任务：向各 pane 发送 Escape 中断 Codex，并暂停自动发送。"""
+        with self.lock:
+            targets = [p for p in self.panes.values() if p.session == name]
+            if not targets:
+                raise KeyError(name)
+            for pane in targets:
+                self.tmux.send_key(pane.target, "Escape")
+                self.set_pane_paused(pane.target, True, "会话已停止")
+            self.log(f"会话 {name} 已停止（已中断任务并暂停自动发送）")
+
+    def delete_session(self, name):
+        """删除（kill）tmux 会话，并取消对它的监控。"""
+        if not any(s["name"] == name for s in self.tmux.list_sessions()):
+            raise KeyError(name)
+        if not self.tmux.kill_session(name):
+            raise ValueError(f"删除会话 {name} 失败")
+        with self.lock:
+            self.selected.discard(name)
+            for target in [t for t, p in self.panes.items() if p.session == name]:
+                del self.panes[target]
+            self.log(f"会话 {name} 已删除")
+        self.refresh()
 
     def send_now(self, target):
         with self.lock:
@@ -224,7 +276,8 @@ class Monitor:
         sent = []
         with self.lock:
             targets = [p for p in sorted(self.panes.values(), key=lambda p: p.target)
-                       if p.session in self.selected and p.state in (STOPPED, CAPACITY)]
+                       if p.session in self.selected and p.enabled
+                       and p.state in (STOPPED, CAPACITY)]
             for pane in targets:
                 if self._send(pane, self.clock(), manual=True):
                     sent.append(pane.target)
@@ -264,9 +317,11 @@ class Monitor:
             for target in list(self.panes):
                 if target not in seen:
                     del self.panes[target]
-            self.sessions = [dict(s, is_codex=s["name"] in codex_sessions,
-                                  selected=s["name"] in self.selected)
-                             for s in sessions]
+            # 有 Codex 的会话排前面（稳定排序，其余保持原顺序）
+            self.sessions = sorted(
+                (dict(s, is_codex=s["name"] in codex_sessions,
+                      selected=s["name"] in self.selected) for s in sessions),
+                key=lambda s: not s["is_codex"])
 
     def _observe(self, pane, text, now, cfg):
         lines = [l.rstrip() for l in text.rstrip("\n").split("\n")]
@@ -275,6 +330,9 @@ class Monitor:
         changed = digest != pane.last_hash
         pane.last_hash = digest
         self._observe_composer(pane, text, now)
+        pane.goal_visible = goal_achieved(text, cfg)
+        if not pane.goal_visible:
+            pane.goal_ack = False
         pane.state, pane.detail = classify(text, cfg)
         if pane.state == WORKING:
             if pane.stopped_since is not None:
@@ -299,6 +357,11 @@ class Monitor:
         self.refresh()
         now = self.clock()
         with self.lock:
+            for pane in self.panes.values():
+                # 最后两行出现 Goal achieved → 暂停该任务，不再发送 continue
+                if (pane.session in self.selected and pane.enabled
+                        and pane.goal_visible and not pane.goal_ack):
+                    self.set_pane_paused(pane.target, True, "检测到 Goal achieved")
             if not self.running:
                 return
             cfg = self.config

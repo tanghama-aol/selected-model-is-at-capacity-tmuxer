@@ -11,7 +11,8 @@ import codex_monitor as cm  # noqa: E402
 WORKING_FRAME = "› fix the bug\n\n• Working (12s • esc to interrupt)\n"
 IDLE_FRAME = "• Done.\n\n› Ask Codex to do anything\n"
 TYPED_FRAME = "• Done.\n\n› hello\n"
-CAP_FRAME = "■ Selected model is at capacity. Please try a different model.\n\n› Ask Codex\n"
+CAP_FRAME = "■ rate limit exceeded. Please try again later.\n\n› Ask Codex\n"
+GOAL_FRAME = "• Goal achieved\n\n› Ask Codex to do anything\n"
 
 
 class FakeTmux:
@@ -19,6 +20,18 @@ class FakeTmux:
         self.frames = {"a:0.0": WORKING_FRAME}
         self.commands = {"a:0.0": "codex"}
         self.sent = []
+        self.keys = []
+        self.killed = []
+
+    def send_key(self, target, key):
+        self.keys.append((target, key))
+        return True
+
+    def kill_session(self, name):
+        self.killed.append(name)
+        for t in [t for t in self.frames if t.split(":")[0] == name]:
+            del self.frames[t]
+        return True
 
     def list_sessions(self):
         names = sorted({t.split(":")[0] for t in self.frames})
@@ -261,6 +274,71 @@ class MonitorTest(unittest.TestCase):
         self.assertEqual([p["target"] for p in snap["panes"]], ["a:0.0"])
         self.assertEqual({s["name"]: s["selected"] for s in snap["sessions"]},
                          {"a": True, "b": False})
+
+    def test_default_capacity_marker(self):
+        self.assertEqual(self.m.config["cap_re"], "rate limit exceeded")
+        self.assertEqual(cm.classify(CAP_FRAME, self.m.config)[0], cm.CAPACITY)
+
+    def test_goal_achieved_pauses_pane_and_stops_sending(self):
+        self.tmux.frames["a:0.0"] = GOAL_FRAME
+        self.advance(1)
+        self.assertTrue(self.pane().paused if hasattr(self.pane(), "paused") else not self.pane().enabled)
+        self.advance(1000)
+        self.advance(1000)
+        self.assertEqual(self.tmux.sent, [])
+        self.assertIn("Goal achieved", self.pane().pause_reason)
+
+    def test_goal_only_checked_in_last_two_lines(self):
+        self.tmux.frames["a:0.0"] = "Goal achieved earlier\n" + "x\n" * 10 + "\n› Ask\n"
+        self.advance(1)
+        self.assertTrue(self.pane().enabled)
+
+    def test_resume_after_goal_sends_again_and_rearms(self):
+        self.tmux.frames["a:0.0"] = GOAL_FRAME
+        self.advance(1)
+        self.m.set_pane_paused("a:0.0", False)
+        self.advance(1)
+        self.assertTrue(self.pane().enabled)          # 标识仍在，但不会再次自动暂停
+        self.advance(40)
+        self.advance(130)
+        self.assertEqual(len(self.tmux.sent), 1)
+        self.tmux.frames["a:0.0"] = IDLE_FRAME        # 标识消失后重新生效
+        self.advance(1)
+        self.tmux.frames["a:0.0"] = GOAL_FRAME
+        self.advance(1)
+        self.assertFalse(self.pane().enabled)
+
+    def test_manual_pause_resume(self):
+        self.tmux.frames["a:0.0"] = IDLE_FRAME
+        self.advance(1)
+        self.m.set_pane_paused("a:0.0", True)
+        self.advance(1000)
+        self.advance(1000)
+        self.assertEqual(self.tmux.sent, [])
+        self.assertEqual(self.m.send_all(), [])
+        self.m.set_pane_paused("a:0.0", False)
+        self.advance(40)
+        self.advance(130)
+        self.assertEqual(len(self.tmux.sent), 1)
+
+    def test_codex_sessions_sorted_first(self):
+        self.tmux.frames = {"a:0.0": "$ ls\n", "b:0.0": "$ top\n", "c:0.0": WORKING_FRAME}
+        self.tmux.commands = {"c:0.0": "codex"}
+        self.m.tick()
+        names = [s["name"] for s in self.m.snapshot()["sessions"]]
+        self.assertEqual(names, ["c", "a", "b"])
+
+    def test_stop_and_delete_session(self):
+        self.m.tick()
+        self.m.stop_session("a")
+        self.assertEqual(self.tmux.keys, [("a:0.0", "Escape")])
+        self.assertFalse(self.pane().enabled)
+        self.m.delete_session("a")
+        self.assertEqual(self.tmux.killed, ["a"])
+        self.assertNotIn("a", self.m.selected)
+        self.assertEqual(self.m.panes, {})
+        with self.assertRaises(KeyError):
+            self.m.delete_session("nope")
 
 
 if __name__ == "__main__":
